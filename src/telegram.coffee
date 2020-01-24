@@ -10,7 +10,7 @@ class Telegram extends Adapter
     @token = process.env['TELEGRAM_TOKEN']
     @webhook = process.env['TELEGRAM_WEBHOOK']
     @interval = process.env['TELEGRAM_INTERVAL'] || 2000
-    @offsetBrainKey = 'telegram-message-offset'
+    @offset = 0
     @api = new telegrambot(@token)
 
     @robot.logger.info "Telegram Adapter Bot " + @token + " Loaded..."
@@ -40,16 +40,21 @@ class Telegram extends Adapter
   # @return string
   ###
   cleanMessageText: (text, chat_id) ->
-# If it is a private chat, automatically prepend the bot name if it does not exist already.
+    # If it is a private chat, automatically prepend the bot name if it does not exist already.
+    @robot.logger.debug "cleanMessageText :: #{text}"
     if (chat_id > 0)
-# Strip out the stuff we don't need.
+      # Strip out the stuff we don't need.
       text = text.replace(/^\//g, '').trim()
 
       text = text.replace(new RegExp('^@?' + @robot.name.toLowerCase(), 'gi'), '');
       text = text.replace(new RegExp('^@?' + @robot.alias.toLowerCase(), 'gi'), '') if @robot.alias
       text = @robot.name + ' ' + text.trim()
-    else
-      text = text.trim()
+    else if (  text.indexOf('@' + @robot.name.toLowerCase()) >= 0  )
+      text = text.replace(/^\//g, '').trim()
+
+      text = text.replace(new RegExp('@?' + @robot.name.toLowerCase(), 'gi'), '');
+      text = text.replace(new RegExp('@?' + @robot.alias.toLowerCase(), 'gi'), '') if @robot.alias
+      text = @robot.name + ' ' + text.trim()
 
     return text
 
@@ -64,10 +69,10 @@ class Telegram extends Adapter
   ###
   applyExtraOptions: (message, extra) ->
     text = message.text
-    autoMarkdown = /\*.+\*/.test(text) or /_.+_/.test(text) or /\[.+\]\(.+\)/.test(text) or /`.+`/.test(text)
+    # autoMarkdown = /\*.+\*/.test(text) or /_.+_/.test(text) or /\[.+\]\(.+\)/.test(text) or /`.+`/.test(text)
 
-    if autoMarkdown
-      message.parse_mode = 'Markdown'
+    # if autoMarkdown
+    message.parse_mode = 'Markdown'
 
     if extra?
       for key, value of extra
@@ -82,7 +87,7 @@ class Telegram extends Adapter
   # @return int
   ###
   getLastOffset: ->
-    parseInt(@robot.brain.get(@offsetBrainKey) ? 0) + 1
+    parseInt(@offset) + 1
 
   ###*
   # Create a new user in relation with a chat_id
@@ -128,7 +133,7 @@ class Telegram extends Adapter
         opts.text = current
 
         @api.invoke 'sendMessage', opts, (err, message) =>
-# Forward the callback to the original handler
+          # Forward the callback to the original handler
           cb.apply @, [err, message]
 
           send cb
@@ -142,13 +147,14 @@ class Telegram extends Adapter
   send: (envelope, strings...) ->
     self = @
     text = strings.join()
+
     data = @applyExtraOptions({chat_id: envelope.room, text: text}, envelope.telegram);
 
     @apiSend data, (err, message) =>
       if (err)
         self.emit 'error', err
       else
-        self.robot.logger.info "Sending message to room: " + envelope.room
+        self.robot.logger.info "Chatbot iNtegra - Sending message to room: " + envelope.room
 
   ###*
   # The only difference between send() and reply() is that we add the "reply_to_message_id" parameter when
@@ -167,7 +173,7 @@ class Telegram extends Adapter
       if (err)
         self.emit 'error', err
       else
-        self.robot.logger.info "Reply message to room/message: " + envelope.room + "/" + envelope.message.id
+        self.robot.logger.info "Chatbot iNtegra - Reply message to room/message: " + envelope.room + "/" + envelope.message.id
 
   ###*
   # "Private" method to handle a new update received via a webhook
@@ -176,8 +182,9 @@ class Telegram extends Adapter
   handleUpdate: (update) ->
     @robot.logger.debug update
 
-    message = update.message || update.edited_message
-    @robot.logger.info "Receiving message_id: " + message.message_id
+    message = update.message || update.edited_message || update.callback_query
+    # @robot.logger.info "Receiving message_id: " + message.message_id
+    # @robot.logger.info "Receiving message for telegram : " + JSON.stringify(update)
 
     # Text event
     if (message.text)
@@ -187,6 +194,20 @@ class Telegram extends Adapter
 
       user = @createUser message.from, message.chat
       @receive new TextMessage user, text, message.message_id
+
+    # Callback query
+    else if message.data
+      text = @cleanMessageText message.data, message.message.chat.id
+
+      @robot.logger.debug "Received callback query: " + message.from.username + " said '" + text + "'"
+
+      user = @createUser message.from, message.message.chat
+
+      @api.invoke 'answerCallbackQuery', {callback_query_id: message.id}, (err, result) ->
+        if (err)
+          self.emit 'error', err
+
+      @receive new TextMessage user, text, message.message.message_id
 
     # Join event
     else if message.new_chat_member
@@ -241,22 +262,15 @@ class Telegram extends Adapter
         if (err)
           self.emit 'error', err
 
-      setInterval =>
-        @api.invoke 'getUpdates', {offset: @getLastOffset(), limit: 10}, (err, result) =>
-          if err
-            @emit 'error', err
-            return
+      setInterval ->
+        self.api.invoke 'getUpdates', {offset: self.getLastOffset(), limit: 10}, (err, result) ->
+          if (err)
+            self.emit 'error', err
+          else
+            self.offset = result[result.length - 1].update_id if result.length
 
-          return unless result.length
-
-          offset = result[result.length - 1].update_id
-          rememberedOffset = @robot.brain.get(@offsetBrainKey)
-          return if offset is rememberedOffset
-
-          @robot.brain.set(@offsetBrainKey, offset).save()
-
-          for msg in result
-            @handleUpdate msg
+            for msg in result
+              self.handleUpdate msg
 
       , @interval
 
